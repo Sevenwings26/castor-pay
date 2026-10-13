@@ -1,0 +1,117 @@
+name: castor-pay-container
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: castor_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-castor_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-castor_password}
+      POSTGRES_DB: ${POSTGRES_DB:-castor_db}
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-castor_user} -d ${POSTGRES_DB:-castor_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: castor_redis
+    restart: unless-stopped
+    ports:
+      - "6389:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: castor_localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,events
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - ./docker/localstack-init.sh:/etc/localstack/init/ready.d/init-queues.sh
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: castor_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://castor_user:castor_password@postgres:5432/castor_db
+      - SYNC_DATABASE_URL=postgresql://castor_user:castor_password@postgres:5432/castor_db
+      - REDIS_URL=redis://redis:6379/0
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - SQS_PAYMENT_QUEUE_URL=http://localstack:4566/000000000000/castor-payment-events
+      - SQS_DLQ_URL=http://localstack:4566/000000000000/castor-payment-events-dlq
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: castor_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://castor_user:castor_password@postgres:5432/castor_db
+      - SYNC_DATABASE_URL=postgresql://castor_user:castor_password@postgres:5432/castor_db
+      - REDIS_URL=redis://redis:6379/0
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - SQS_PAYMENT_QUEUE_URL=http://localstack:4566/000000000000/castor-payment-events
+      - SQS_DLQ_URL=http://localstack:4566/000000000000/castor-payment-events-dlq
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m app.workers.event_consumer
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: castor_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
